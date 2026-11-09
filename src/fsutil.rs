@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -130,7 +130,12 @@ pub fn mtime_of(meta: &fs::Metadata) -> SystemTime {
 
 /// Lower-cased path string: Windows paths are case-insensitive.
 pub fn path_key(p: &Path) -> String {
-    p.to_string_lossy().to_lowercase()
+    let s = p.to_string_lossy();
+    // phone paths are case-sensitive (a.jpg and A.jpg can both exist on Android)
+    if s.starts_with('📱') {
+        return s.to_string();
+    }
+    s.to_lowercase()
 }
 
 /// "name (2).ext", "name (3).ext"... the first that is free on disk and not in `taken`.
@@ -169,26 +174,23 @@ pub fn sanitize(name: &str) -> String {
 
 pub type Hash = [u8; 32];
 
-const QUICK_CHUNK: u64 = 64 * 1024;
+/// Bytes read for the quick fingerprint. Only the start of the file, because phones (MTP)
+/// can't seek to the end cheaply.
+pub const QUICK_CHUNK: usize = 128 * 1024;
 
-/// Cheap fingerprint: size + first and last 64 KB. Equal full content ⇒ equal quick hash.
-pub fn quick_hash(path: &Path, size: u64) -> io::Result<Hash> {
-    let mut f = File::open(path)?;
+pub fn quick_hash_bytes(size: u64, first: &[u8]) -> Hash {
     let mut h = blake3::Hasher::new();
     h.update(&size.to_le_bytes());
-    if size <= QUICK_CHUNK * 2 {
-        let mut buf = Vec::with_capacity(size as usize);
-        f.read_to_end(&mut buf)?;
-        h.update(&buf);
-    } else {
-        let mut buf = vec![0u8; QUICK_CHUNK as usize];
-        f.read_exact(&mut buf)?;
-        h.update(&buf);
-        f.seek(SeekFrom::End(-(QUICK_CHUNK as i64)))?;
-        f.read_exact(&mut buf)?;
-        h.update(&buf);
-    }
-    Ok(*h.finalize().as_bytes())
+    h.update(&first[..first.len().min(QUICK_CHUNK)]);
+    *h.finalize().as_bytes()
+}
+
+/// Cheap fingerprint: size + first 128 KB. Equal full content ⇒ equal quick hash.
+pub fn quick_hash(path: &Path, size: u64) -> io::Result<Hash> {
+    let f = File::open(path)?;
+    let mut buf = Vec::with_capacity(QUICK_CHUNK);
+    f.take(QUICK_CHUNK as u64).read_to_end(&mut buf)?;
+    Ok(quick_hash_bytes(size, &buf))
 }
 
 struct CacheEntry {
@@ -261,14 +263,25 @@ pub fn clear_cache() {
 
 /// Full-content hash, remembered across runs as long as size and date are unchanged.
 pub fn full_hash(path: &Path, size: u64, mtime: SystemTime, cancel: &AtomicBool) -> io::Result<Hash> {
-    let key = path_key(path);
+    full_hash_with(path, size, mtime, cancel, || Ok(Box::new(File::open(path)?)))
+}
+
+/// Like [`full_hash`] for any source (`key` names it in the cache).
+pub fn full_hash_with(
+    key: &Path,
+    size: u64,
+    mtime: SystemTime,
+    cancel: &AtomicBool,
+    open: impl FnOnce() -> io::Result<Box<dyn Read>>,
+) -> io::Result<Hash> {
+    let key = path_key(key);
     let mt = secs(mtime);
     if let Some(e) = cache().lock().unwrap().get(&key) {
         if e.size == size && e.mtime == mt {
             return Ok(e.hash);
         }
     }
-    let mut f = File::open(path)?;
+    let mut f = open()?;
     let mut h = blake3::Hasher::new();
     let mut buf = vec![0u8; 1 << 20];
     loop {
@@ -292,19 +305,32 @@ pub fn full_hash(path: &Path, size: u64, mtime: SystemTime, cancel: &AtomicBool)
 
 /// Copies `src` to `dst` through a temporary file, keeps the modification date.
 pub fn copy_file(src: &Path, dst: &Path, bytes: &AtomicU64, cancel: &AtomicBool) -> io::Result<()> {
+    let meta = fs::metadata(src)?;
+    copy_from(Box::new(File::open(src)?), meta.len(), mtime_of(&meta), dst, bytes, cancel)
+}
+
+/// Copies from any reader (disk or phone) through a temporary file and sets the date.
+pub fn copy_from(
+    mut r: Box<dyn Read>,
+    len: u64,
+    mtime: SystemTime,
+    dst: &Path,
+    bytes: &AtomicU64,
+    cancel: &AtomicBool,
+) -> io::Result<()> {
     if let Some(p) = dst.parent() {
         fs::create_dir_all(p)?;
     }
-    let meta = fs::metadata(src)?;
     let tmp = {
         let mut s = dst.as_os_str().to_owned();
         s.push(TMP_SUFFIX);
         PathBuf::from(s)
     };
     let res = (|| -> io::Result<()> {
-        let mut r = File::open(src)?;
         let mut w = File::create(&tmp)?;
+        let mut h = blake3::Hasher::new();
         let mut buf = vec![0u8; 1 << 20];
+        let mut total = 0u64;
         loop {
             if cancel.load(Ordering::Relaxed) {
                 return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
@@ -314,17 +340,30 @@ pub fn copy_file(src: &Path, dst: &Path, bytes: &AtomicU64, cancel: &AtomicBool)
                 break;
             }
             w.write_all(&buf[..n])?;
+            h.update(&buf[..n]);
+            total += n as u64;
             bytes.fetch_add(n as u64, Ordering::Relaxed);
         }
         w.flush()?;
         w.sync_all()?;
         drop(w);
-        let ft = filetime::FileTime::from_last_modification_time(&meta);
-        let _ = filetime::set_file_mtime(&tmp, ft);
-        if fs::metadata(&tmp)?.len() != meta.len() {
-            return Err(io::Error::other("size mismatch after copy"));
+        if len > 0 && total != len {
+            return Err(io::Error::other(crate::i18n::t("err_short_read")));
         }
-        fs::rename(&tmp, dst)
+        // read the written copy back and compare it with what was read from the source
+        let written = hash_reader(&mut File::open(&tmp)?, cancel)?;
+        let expected = *h.finalize().as_bytes();
+        if written != expected {
+            return Err(io::Error::other(crate::i18n::t("err_verify")));
+        }
+        if mtime > UNIX_EPOCH {
+            let _ = filetime::set_file_mtime(&tmp, filetime::FileTime::from_system_time(mtime));
+        }
+        rename_noreplace(&tmp, dst)?;
+        if let Ok(md) = fs::metadata(dst) {
+            remember_hash(dst, md.len(), mtime_of(&md), expected);
+        }
+        Ok(())
     })();
     if res.is_err() {
         let _ = fs::remove_file(&tmp);
@@ -332,7 +371,86 @@ pub fn copy_file(src: &Path, dst: &Path, bytes: &AtomicU64, cancel: &AtomicBool)
     res
 }
 
-/// Move: rename when possible, otherwise copy + delete.
+fn hash_reader(r: &mut dyn Read, cancel: &AtomicBool) -> io::Result<Hash> {
+    let mut h = blake3::Hasher::new();
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
+        }
+        let n = r.read(&mut buf)?;
+        if n == 0 {
+            return Ok(*h.finalize().as_bytes());
+        }
+        h.update(&buf[..n]);
+    }
+}
+
+fn remember_hash(path: &Path, size: u64, mtime: SystemTime, hash: Hash) {
+    cache().lock().unwrap().insert(path_key(path), CacheEntry { size, mtime: secs(mtime), hash });
+}
+
+/// Windows path for the wide-string APIs, long paths included.
+fn win_path(p: &Path) -> Vec<u16> {
+    let abs = std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
+    let s = abs.to_string_lossy().to_string();
+    let s = if s.starts_with(r"\\?\") || s.len() < 248 {
+        s
+    } else if let Some(unc) = s.strip_prefix(r"\\") {
+        format!(r"\\?\UNC\{unc}")
+    } else {
+        format!(r"\\?\{s}")
+    };
+    wide(&s)
+}
+
+/// Rename that never overwrites: fails if `to` already exists
+/// (std::fs::rename on Windows silently replaces the target).
+pub fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_WRITE_THROUGH};
+    let (a, b) = (win_path(from), win_path(to));
+    let ok = unsafe { MoveFileExW(a.as_ptr(), b.as_ptr(), MOVEFILE_WRITE_THROUGH) };
+    if ok == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// True if both paths are the very same file on disk (e.g. seen through two drive letters).
+pub fn same_file(a: &Path, b: &Path) -> bool {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION};
+    let id = |p: &Path| -> Option<(u32, u32, u32)> {
+        let f = File::open(p).ok()?;
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        let ok = unsafe { GetFileInformationByHandle(f.as_raw_handle() as _, &mut info) };
+        (ok != 0).then_some((info.dwVolumeSerialNumber, info.nFileIndexHigh, info.nFileIndexLow))
+    };
+    match (id(a), id(b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => true, // can't tell: treat as the same so nothing gets deleted
+    }
+}
+
+/// Before an "extra" copy is removed: the kept file must still exist, be a different file,
+/// and have exactly the same content.
+pub fn safe_to_remove_extra(extra: &Path, kept: &Path, cancel: &AtomicBool) -> Result<(), String> {
+    let (Ok(me), Ok(mk)) = (fs::metadata(extra), fs::metadata(kept)) else {
+        return Err(crate::i18n::t("err_kept_missing").into());
+    };
+    if me.len() != mk.len() || same_file(extra, kept) {
+        return Err(crate::i18n::t("err_not_dup").into());
+    }
+    let he = hash_reader(&mut File::open(extra).map_err(|e| e.to_string())?, cancel).map_err(|e| e.to_string())?;
+    let hk = hash_reader(&mut File::open(kept).map_err(|e| e.to_string())?, cancel).map_err(|e| e.to_string())?;
+    if he != hk {
+        return Err(crate::i18n::t("err_not_dup").into());
+    }
+    Ok(())
+}
+
+/// Move: rename when possible (same disk), otherwise a verified copy and then delete.
 pub fn move_file(src: &Path, dst: &Path, bytes: &AtomicU64, cancel: &AtomicBool) -> io::Result<()> {
     if let Some(p) = dst.parent() {
         fs::create_dir_all(p)?;
@@ -340,17 +458,40 @@ pub fn move_file(src: &Path, dst: &Path, bytes: &AtomicU64, cancel: &AtomicBool)
     if dst.exists() {
         return Err(io::Error::new(io::ErrorKind::AlreadyExists, "destination exists"));
     }
-    match fs::rename(src, dst) {
+    match rename_noreplace(src, dst) {
         Ok(()) => {
             if let Ok(m) = fs::metadata(dst) {
                 bytes.fetch_add(m.len(), Ordering::Relaxed);
             }
             Ok(())
         }
-        Err(_) => {
+        // ERROR_NOT_SAME_DEVICE: only then copy + delete; every other error is reported
+        Err(e) if e.raw_os_error() == Some(17) => {
             copy_file(src, dst, bytes, cancel)?;
             fs::remove_file(src)
         }
+        Err(e) => Err(e),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// History (what was done, in plain text, for people who forget)
+// ---------------------------------------------------------------------------
+
+pub fn history_dir() -> PathBuf {
+    crate::settings::data_dir().join("Istorija")
+}
+
+pub fn log(action: &str, from: &Path, to: Option<&Path>) {
+    let now = chrono::Local::now();
+    let _ = fs::create_dir_all(history_dir());
+    let file = history_dir().join(format!("{}.txt", now.format("%Y-%m")));
+    if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(file) {
+        let line = match to {
+            Some(t) => format!("{}  {}  {}  →  {}\r\n", now.format("%d.%m.%Y %H:%M:%S"), action, from.display(), t.display()),
+            None => format!("{}  {}  {}\r\n", now.format("%d.%m.%Y %H:%M:%S"), action, from.display()),
+        };
+        let _ = f.write_all(line.as_bytes());
     }
 }
 

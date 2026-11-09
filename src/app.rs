@@ -5,6 +5,7 @@ use crate::fsutil::{self, Drive, Kind, KindFilter, Known};
 use crate::i18n::{self, fmt_date, fmt_num, fmt_size, t, tf, Lang};
 use crate::job::{Progress, Report};
 use crate::organize::{self, OrgMode, OrgPlan, Scheme};
+use crate::phone;
 use crate::settings::{DupAction, LayoutChoice, Settings, SourceCfg, Theme};
 use crate::sync::{self, Action, Item, Status};
 use crate::thumbs::Thumbs;
@@ -73,6 +74,94 @@ struct Running {
     started: Instant,
 }
 
+enum PMsg {
+    Devices(Vec<phone::Device>),
+    Folders(u64, Result<Vec<phone::Entry>, String>),
+    Camera(Option<Vec<String>>),
+}
+
+/// The "pick a folder on the phone" window.
+struct PhoneBrowser {
+    devices: Option<Vec<phone::Device>>,
+    dev: Option<phone::Device>,
+    /// (object id, name) from the phone root down to the folder shown
+    stack: Vec<(String, String)>,
+    folders: Option<Result<Vec<phone::Entry>, String>>,
+    camera: Option<Option<Vec<String>>>,
+    gen: u64,
+    tx: std::sync::mpsc::Sender<PMsg>,
+    rx: std::sync::mpsc::Receiver<PMsg>,
+}
+
+impl PhoneBrowser {
+    fn new(ctx: &egui::Context) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut b = Self { devices: None, dev: None, stack: Vec::new(), folders: None, camera: None, gen: 0, tx, rx };
+        b.load_devices(ctx);
+        b
+    }
+    fn load_devices(&mut self, ctx: &egui::Context) {
+        self.devices = None;
+        let (tx, ctx) = (self.tx.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            phone::reset();
+            let _ = tx.send(PMsg::Devices(phone::list_devices()));
+            ctx.request_repaint();
+        });
+    }
+    fn open_device(&mut self, ctx: &egui::Context, d: phone::Device) {
+        self.dev = Some(d.clone());
+        self.stack.clear();
+        self.camera = None;
+        self.load_folders(ctx);
+        let (tx, ctx) = (self.tx.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let mut found = None;
+            if let Ok(st) = phone::children(&d.id, phone::WPD_DEVICE_OBJECT_ID_STR) {
+                'outer: for s in st.into_iter().filter(|e| e.is_folder) {
+                    // Android: DCIM\Camera; iPhone: DCIM\100APPLE, 101APPLE… → the whole DCIM
+                    for path in [
+                        vec![s.name.clone(), "DCIM".to_string(), "Camera".to_string()],
+                        vec![s.name.clone(), "DCIM".to_string()],
+                    ] {
+                        if phone::resolve(&d.id, &path).is_ok() {
+                            found = Some(path);
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+            let _ = tx.send(PMsg::Camera(found));
+            ctx.request_repaint();
+        });
+    }
+    fn load_folders(&mut self, ctx: &egui::Context) {
+        let Some(d) = self.dev.clone() else { return };
+        self.gen += 1;
+        self.folders = None;
+        let gen = self.gen;
+        let parent = self.stack.last().map(|s| s.0.clone()).unwrap_or_else(|| phone::WPD_DEVICE_OBJECT_ID_STR.into());
+        let (tx, ctx) = (self.tx.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let r = phone::children(&d.id, &parent)
+                .map(|v| v.into_iter().filter(|e| e.is_folder && !e.name.starts_with('.')).collect())
+                .map_err(|e| e.to_string());
+            let _ = tx.send(PMsg::Folders(gen, r));
+            ctx.request_repaint();
+        });
+    }
+    fn poll(&mut self) {
+        while let Ok(m) = self.rx.try_recv() {
+            match m {
+                PMsg::Devices(d) => self.devices = Some(d),
+                PMsg::Folders(g, r) if g == self.gen => self.folders = Some(r),
+                PMsg::Folders(..) => {}
+                PMsg::Camera(c) => self.camera = Some(c),
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum Confirm {
     Copy,
@@ -93,6 +182,7 @@ pub struct MarkSync {
     confirm: Option<Confirm>,
     toast: Option<(String, Instant)>,
     applied_theme: Option<Theme>,
+    phone_ui: Option<PhoneBrowser>,
     // sync
     items: Vec<Item>,
     compared: bool,
@@ -100,6 +190,7 @@ pub struct MarkSync {
     search: String,
     view: Vec<usize>,
     view_dirty: bool,
+    warnings: Vec<String>,
     // organize
     org_plan: Option<OrgPlan>,
     // duplicates
@@ -134,12 +225,14 @@ impl MarkSync {
             confirm: None,
             toast: None,
             applied_theme: None,
+            phone_ui: None,
             items: Vec::new(),
             compared: false,
             hidden_status,
             search: String::new(),
             view: Vec::new(),
             view_dirty: true,
+            warnings: Vec::new(),
             org_plan: None,
             groups: Vec::new(),
             dup_rows: Vec::new(),
@@ -176,9 +269,11 @@ impl MarkSync {
             ctx.request_repaint_after(Duration::from_millis(100));
             return;
         };
+        let warnings = std::mem::take(&mut *job.p.warnings.lock().unwrap());
         self.job = None;
         match done {
             Done::Compare(Ok(items)) => {
+                self.warnings = warnings;
                 self.items = items;
                 self.compared = true;
                 self.view_dirty = true;
@@ -190,11 +285,11 @@ impl MarkSync {
                 }
             }
             Done::Copy(rep) => {
-                for &i in &rep.done_idx {
+                for (&i, to) in rep.done_idx.iter().zip(&rep.done_dest) {
                     if let Some(it) = self.items.get_mut(i) {
                         it.status = Status::Exists;
                         it.selected = false;
-                        it.same_as = Some(it.dest.clone());
+                        it.same_as = Some(to.clone());
                     }
                 }
                 self.view_dirty = true;
@@ -423,6 +518,24 @@ fn file_name(p: &Path) -> String {
 }
 
 
+/// The album / "check the date" / duplicates tick boxes (shared by Sync and Organize).
+fn org_option_boxes(ui: &mut Ui, s: &mut Settings, with_dups: bool) -> bool {
+    let mut changed = false;
+    changed |= ui.checkbox(&mut s.org_keep_albums, t("opt_albums")).changed();
+    ui.label(RichText::new(format!("      {}", t("opt_albums_hint"))).weak().small());
+    changed |= ui.checkbox(&mut s.org_flag_dates, t("opt_check_date")).changed();
+    ui.label(RichText::new(format!("      {}", t("opt_check_date_hint"))).weak().small());
+    if with_dups {
+        changed |= ui.checkbox(&mut s.org_remove_dups, t("opt_dups")).changed();
+        ui.label(RichText::new(format!("      {}", t("opt_dups_hint"))).weak().small());
+    }
+    changed
+}
+
+fn ps_display_short(path: &[String]) -> String {
+    path.join(" › ")
+}
+
 /// "C:\…\Laptop\Slike" for long paths.
 pub fn short_path(p: &Path, max: usize) -> String {
     let full = p.to_string_lossy().to_string();
@@ -478,7 +591,7 @@ impl eframe::App for MarkSync {
             .show_separator_line(false)
             .show(ctx, |ui| self.top_bar(ui));
 
-        let busy = self.job.is_some() || self.confirm.is_some() || self.report.is_some();
+        let busy = self.job.is_some() || self.confirm.is_some() || self.report.is_some() || self.phone_ui.is_some();
         if self.tab == Tab::Sync && self.compared {
             egui::TopBottomPanel::bottom("syncbar")
                 .frame(Frame::none().fill(ctx.style().visuals.window_fill).inner_margin(Margin::symmetric(22.0, 12.0)))
@@ -505,6 +618,7 @@ impl eframe::App for MarkSync {
                 });
             });
 
+        self.phone_window(ctx);
         self.job_window(ctx);
         self.confirm_window(ctx);
         self.report_window(ctx);
@@ -545,6 +659,7 @@ impl MarkSync {
                 self.spawn(ctx, "job_dupes", move |p| Done::Dupes(dupes::find(&roots, k, h, p)));
             }
             "confirm_copy" => self.confirm = Some(Confirm::Copy),
+            "phone" => self.phone_ui = Some(PhoneBrowser::new(ctx)),
             "light" => self.s.theme = Theme::Light,
             s if s.starts_with("lang:") => i18n::set_lang(Lang::from_code(&s[5..])),
             _ => {}
@@ -670,7 +785,9 @@ impl MarkSync {
                 }
             });
             ui.add_space(16.0);
-            let ready = !self.trees.is_empty() && self.s.target.is_some() && self.s.kinds.any();
+            let ready = (!self.trees.is_empty() || !self.s.phone_sources.is_empty())
+                && self.s.target.is_some()
+                && self.s.kinds.any();
             ui.vertical_centered(|ui| {
                 let r = big_button(ui, &format!("🔍  {}", t("compare")), ready);
                 let r = if ready { r } else { r.on_disabled_hover_text(t("compare_need")) };
@@ -692,6 +809,9 @@ impl MarkSync {
                     self.save();
                 }
             }
+            if ui.button(format!("📱 {}", t("phone_btn"))).on_hover_text(t("phone_btn_hint")).clicked() {
+                self.phone_ui = Some(PhoneBrowser::new(ui.ctx()));
+            }
             for (k, icon, key) in [
                 (Known::Pictures, "🖼", "kf_pictures"),
                 (Known::Videos, "🎬", "kf_videos"),
@@ -708,7 +828,26 @@ impl MarkSync {
             }
         });
         ui.add_space(6.0);
-        if self.trees.is_empty() {
+        let mut remove_phone = None;
+        for (i, ps) in self.s.phone_sources.iter().enumerate() {
+            Frame::none().fill(ui.visuals().faint_bg_color).rounding(10.0).inner_margin(8.0).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.add_space(18.0);
+                    ui.label(RichText::new(format!("📱 {}", ps.display())).strong());
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.small_button("✖").on_hover_text(t("remove")).clicked() {
+                            remove_phone = Some(i);
+                        }
+                    });
+                });
+            });
+        }
+        if let Some(i) = remove_phone {
+            self.s.phone_sources.remove(i);
+            self.save();
+        }
+        if self.trees.is_empty() && self.s.phone_sources.is_empty() {
             Frame::none().fill(ui.visuals().faint_bg_color).rounding(10.0).inner_margin(14.0).show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.label(RichText::new(t("src_empty")).weak());
@@ -818,6 +957,7 @@ impl MarkSync {
         });
         if self.s.layout == LayoutChoice::Organized {
             ui.label(RichText::new(format!("{}  {}", t("example"), self.s.layout_scheme.example())).weak().small());
+            changed |= org_option_boxes(ui, &mut self.s, false);
         }
         if changed {
             self.save();
@@ -829,11 +969,13 @@ impl MarkSync {
         self.save();
         let inp = sync::CompareInput {
             sources: self.trees.iter().map(|t| t.source()).collect(),
+            phones: self.s.phone_sources.clone(),
             target,
             kinds: self.s.kinds,
             layout: self.s.layout,
             scheme: self.s.layout_scheme,
             skip_hidden: self.s.skip_hidden,
+            org_opts: organize::OrgOptions { remove_dups: false, ..self.s.org_options() },
         };
         if inp.layout == LayoutChoice::Organized && inp.scheme.needs_meta() {
             crate::meta::warm_up_geocoder();
@@ -912,6 +1054,21 @@ impl MarkSync {
                 }
             }
         });
+        if !self.warnings.is_empty() {
+            card(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(RichText::new(format!("⚠ {}", tf("warn_unreadable", &[&fmt_num(self.warnings.len() as u64)]))).color(AMBER).strong());
+                ui.label(RichText::new(t("warn_unreadable_hint")).weak().small());
+                egui::CollapsingHeader::new(t("warn_show")).id_salt("warns").show(ui, |ui| {
+                    egui::ScrollArea::vertical().max_height(140.0).show(ui, |ui| {
+                        for w in self.warnings.iter().take(500) {
+                            ui.label(RichText::new(w).small());
+                        }
+                    });
+                });
+            });
+            ui.add_space(6.0);
+        }
         if self.items.is_empty() {
             ui.add_space(30.0);
             ui.vertical_centered(|ui| ui.label(RichText::new(t("nothing_found")).size(18.0)));
@@ -1195,6 +1352,12 @@ impl MarkSync {
                 });
                 ui.label(RichText::new(format!("      {}", t("org_copy_hint"))).weak().small());
             });
+            ui.add_space(12.0);
+            card(ui, |ui| {
+                ui.set_width(ui.available_width());
+                section_title(ui, "4", t("org_extra"), "");
+                changed |= org_option_boxes(ui, &mut self.s, true);
+            });
             if changed {
                 self.save();
             }
@@ -1208,7 +1371,7 @@ impl MarkSync {
                 }
             });
 
-            if let Some(j) = self.s.last_undo.clone() {
+            if let Some(j) = organize::latest_journal() {
                 if let Some(journal) = organize::load_journal(&j) {
                     ui.add_space(16.0);
                     card(ui, |ui| {
@@ -1242,11 +1405,12 @@ impl MarkSync {
         let Some(root) = self.s.org_root.clone() else { return };
         let dest = self.s.org_dest.clone();
         let (scheme, mode, kinds, hidden) = (self.s.org_scheme, self.s.org_mode, self.s.org_kinds, self.s.skip_hidden);
+        let opts = self.s.org_options();
         if matches!(scheme, Scheme::Location | Scheme::YearLocation) {
             crate::meta::warm_up_geocoder();
         }
         self.spawn(ctx, "job_plan", move |p| {
-            Done::Plan(organize::plan(&root, dest.as_deref(), scheme, mode, kinds, hidden, p))
+            Done::Plan(organize::plan(&root, dest.as_deref(), scheme, mode, kinds, hidden, opts, p))
         });
     }
 
@@ -1269,6 +1433,13 @@ impl MarkSync {
                     badge(ui, &tf("org_in_place", &[&fmt_num(plan.in_place as u64)]), GREEN);
                 }
                 badge(ui, &tf("org_folders", &[&fmt_num(plan.folders.len() as u64)]), PURPLE);
+                if !plan.dups.is_empty() {
+                    let b: u64 = plan.dups.iter().map(|d| d.size).sum();
+                    badge(ui, &tf("org_dups", &[&fmt_num(plan.dups.len() as u64), &fmt_size(b)]), AMBER);
+                }
+                if plan.uncertain > 0 {
+                    badge(ui, &tf("org_uncertain", &[&fmt_num(plan.uncertain as u64)]), RED);
+                }
                 ui.label(RichText::new(format!("{} {}", plan.scheme.icon(), plan.scheme.title())).strong());
             });
             ui.label(RichText::new(format!("📁 {}", plan.dest_root.display())).weak());
@@ -1584,6 +1755,13 @@ impl MarkSync {
                     }
                     ui.label(RichText::new(t("clear_cache_hint")).weak().small());
                 });
+                ui.horizontal(|ui| {
+                    if ui.button(format!("📜 {}", t("history"))).clicked() {
+                        let _ = std::fs::create_dir_all(fsutil::history_dir());
+                        fsutil::open_in_explorer(&fsutil::history_dir(), false);
+                    }
+                    ui.label(RichText::new(t("history_hint")).weak().small());
+                });
                 if ui.button(format!("📂 {}", t("open_data"))).clicked() {
                     let _ = std::fs::create_dir_all(crate::settings::data_dir());
                     fsutil::open_in_explorer(&crate::settings::data_dir(), false);
@@ -1604,6 +1782,152 @@ impl MarkSync {
     // -----------------------------------------------------------------------
     // Overlays
     // -----------------------------------------------------------------------
+
+    fn phone_window(&mut self, ctx: &egui::Context) {
+        let Some(b) = &mut self.phone_ui else { return };
+        b.poll();
+        let mut close = false;
+        let mut chosen: Option<phone::PhoneSource> = None;
+        let mut open = true;
+        egui::Window::new(format!("📱 {}", t("phone_title")))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+            .order(egui::Order::Foreground)
+            .fixed_size(vec2(560.0, 0.0))
+            .show(ctx, |ui| {
+                // 1. which phone
+                let Some(devs) = b.devices.clone() else {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(t("phone_searching"));
+                    });
+                    return;
+                };
+                if b.dev.is_none() {
+                    if devs.is_empty() {
+                        ui.label(RichText::new(t("phone_none")).size(15.5));
+                        ui.add_space(6.0);
+                        if ui.button(format!("⟳ {}", t("phone_retry"))).clicked() {
+                            b.load_devices(ctx);
+                        }
+                        return;
+                    }
+                    if devs.len() == 1 {
+                        b.open_device(ctx, devs[0].clone());
+                    } else {
+                        ui.label(t("phone_which"));
+                        for d in devs {
+                            if chip(ui, false, &format!("📱 {}", d.name)).clicked() {
+                                b.open_device(ctx, d);
+                            }
+                        }
+                        return;
+                    }
+                }
+                let Some(dev) = b.dev.clone() else { return };
+
+                // 2. shortcut to the camera folder
+                match &b.camera {
+                    None => {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(t("phone_find_camera"));
+                        });
+                    }
+                    Some(Some(path)) => {
+                        let ps = phone::PhoneSource { device: dev.name.clone(), path: path.clone() };
+                        if big_button(ui, &format!("📷  {}", t("phone_camera")), true).on_hover_text(ps.display()).clicked() {
+                            chosen = Some(ps);
+                        }
+                        ui.label(RichText::new(ps_display_short(path)).weak().small());
+                    }
+                    Some(None) => {}
+                }
+                ui.add_space(8.0);
+                ui.separator();
+                ui.label(RichText::new(t("phone_or_pick")).strong());
+
+                // 3. browse
+                ui.horizontal_wrapped(|ui| {
+                    if ui.small_button(format!("📱 {}", dev.name)).clicked() {
+                        b.stack.clear();
+                        b.load_folders(ctx);
+                    }
+                    let mut cut = None;
+                    for (i, (_, name)) in b.stack.iter().enumerate() {
+                        ui.label("›");
+                        if ui.small_button(name).clicked() {
+                            cut = Some(i + 1);
+                        }
+                    }
+                    if let Some(n) = cut {
+                        b.stack.truncate(n);
+                        b.load_folders(ctx);
+                    }
+                });
+                let mut enter = None;
+                egui::ScrollArea::vertical().max_height(260.0).auto_shrink([false, true]).show(ui, |ui| match &b.folders {
+                    None => {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(t("phone_loading"));
+                        });
+                    }
+                    Some(Err(e)) => {
+                        ui.label(RichText::new(e).color(RED));
+                        ui.label(RichText::new(t("phone_unlock_hint")).weak());
+                    }
+                    Some(Ok(list)) if list.is_empty() => {
+                        ui.label(RichText::new(t("phone_empty")).weak());
+                        if b.stack.is_empty() {
+                            ui.label(RichText::new(t("phone_unlock_hint")).weak());
+                        }
+                    }
+                    Some(Ok(list)) => {
+                        for e in list {
+                            ui.horizontal(|ui| {
+                                if ui.add(egui::Button::new(format!("📁 {}", e.name)).frame(false)).clicked() {
+                                    enter = Some((e.obj.clone(), e.name.clone()));
+                                }
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    if !b.stack.is_empty() && ui.small_button(t("phone_pick")).clicked() {
+                                        let mut path: Vec<String> = b.stack.iter().map(|s| s.1.clone()).collect();
+                                        path.push(e.name.clone());
+                                        chosen = Some(phone::PhoneSource { device: dev.name.clone(), path });
+                                    }
+                                });
+                            });
+                        }
+                    }
+                });
+                if let Some(en) = enter {
+                    b.stack.push(en);
+                    b.load_folders(ctx);
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if b.stack.len() >= 2 && ui.button(format!("✔ {}", t("phone_pick_this"))).clicked() {
+                        chosen = Some(phone::PhoneSource { device: dev.name.clone(), path: b.stack.iter().map(|s| s.1.clone()).collect() });
+                    }
+                    if ui.button(t("cancel")).clicked() {
+                        close = true;
+                    }
+                });
+            });
+        if let Some(ps) = chosen {
+            if !self.s.phone_sources.contains(&ps) {
+                self.s.phone_sources.push(ps);
+            }
+            self.compared = false;
+            self.save();
+            close = true;
+        }
+        if close || !open {
+            self.phone_ui = None;
+        }
+    }
 
     fn job_window(&mut self, ctx: &egui::Context) {
         let Some(job) = &self.job else { return };
@@ -1674,8 +1998,15 @@ impl MarkSync {
             Confirm::Organize => {
                 let plan = self.org_plan.as_ref();
                 let n = plan.map(|p| p.moves.len()).unwrap_or(0) as u64;
-                let key = if plan.map(|p| p.mode) == Some(OrgMode::MoveInPlace) { "confirm_org_move" } else { "confirm_org_copy" };
-                (t("confirm_title"), tf(key, &[&fmt_num(n)]))
+                let in_place = plan.map(|p| p.mode) == Some(OrgMode::MoveInPlace);
+                let key = if in_place { "confirm_org_move" } else { "confirm_org_copy" };
+                let mut s = tf(key, &[&fmt_num(n)]);
+                let d = plan.map(|p| p.dups.len()).unwrap_or(0) as u64;
+                if d > 0 {
+                    s.push_str("\n\n");
+                    s.push_str(&tf(if in_place { "confirm_org_dups" } else { "confirm_org_dups_copy" }, &[&fmt_num(d)]));
+                }
+                (t("confirm_title"), s)
             }
             Confirm::RemoveDups => {
                 let extra: u64 = self.groups.iter().map(|g| g.files.len() as u64 - 1).sum();
@@ -1730,7 +2061,7 @@ impl MarkSync {
                     self.spawn(ctx, "job_dup_remove", move |p| Done::DupRemoved(dupes::remove_extras(&groups, &roots, action, p)));
                 }
                 Confirm::Undo => {
-                    if let Some(j) = self.s.last_undo.clone() {
+                    if let Some(j) = organize::latest_journal() {
                         self.spawn(ctx, "job_undo", move |p| Done::Undo(organize::undo(&j, p)));
                     }
                 }
@@ -1741,6 +2072,12 @@ impl MarkSync {
     fn report_window(&mut self, ctx: &egui::Context) {
         let Some((title, rep)) = &self.report else { return };
         let mut close = false;
+        let mut organize_target = false;
+        let offer_organize = *title == "rep_copy"
+            && rep.ok_files > 0
+            && !rep.cancelled
+            && self.s.layout == LayoutChoice::Organized
+            && self.s.target.is_some();
         egui::Window::new(t(title))
             .collapsible(false)
             .resizable(false)
@@ -1756,6 +2093,9 @@ impl MarkSync {
                         ui.label(RichText::new(format!("🎉 {}", t("all_done"))).color(GREEN).size(18.0).family(semibold()));
                     }
                     ui.label(RichText::new(tf("rep_ok", &[&fmt_num(rep.ok_files), &fmt_size(rep.ok_bytes)])).size(16.0));
+                    if rep.dups_removed > 0 {
+                        ui.label(tf("rep_dups_removed", &[&fmt_num(rep.dups_removed)]));
+                    }
                 }
                 if !rep.errors.is_empty() {
                     if !is_error_only {
@@ -1781,7 +2121,28 @@ impl MarkSync {
                         }
                     }
                 });
+                if offer_organize {
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.label(RichText::new(t("after_copy_q")).strong());
+                    ui.label(RichText::new(t("after_copy_hint")).weak().small());
+                    if big_button(ui, &format!("🗂  {}", t("after_copy_btn")), true).clicked() {
+                        organize_target = true;
+                        close = true;
+                    }
+                }
             });
+        if organize_target {
+            if let Some(tg) = self.s.target.clone() {
+                self.s.org_root = Some(tg);
+                self.s.org_scheme = self.s.layout_scheme;
+                self.s.org_mode = OrgMode::MoveInPlace;
+                self.s.org_kinds = self.s.kinds;
+                self.save();
+                self.tab = Tab::Organize;
+                self.start_plan(ctx);
+            }
+        }
         if close {
             self.report = None;
         }

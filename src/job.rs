@@ -13,6 +13,8 @@ pub struct Progress {
     pub bytes: AtomicU64,
     pub bytes_total: AtomicU64,
     pub cancel: AtomicBool,
+    /// things that could not be read (shown to the user, never silently dropped)
+    pub warnings: Mutex<Vec<String>>,
 }
 
 impl Progress {
@@ -26,6 +28,9 @@ impl Progress {
     }
     pub fn set_current(&self, s: impl Into<String>) {
         *self.current.lock().unwrap() = s.into();
+    }
+    pub fn warn(&self, w: String) {
+        self.warnings.lock().unwrap().push(w);
     }
     pub fn cancelled(&self) -> bool {
         self.cancel.load(Ordering::Relaxed)
@@ -50,4 +55,8 @@ pub struct Report {
     pub open_path: Option<std::path::PathBuf>,
     /// indices of items that were handled successfully
     pub done_idx: Vec<usize>,
+    /// where each of `done_idx` was written
+    pub done_dest: Vec<std::path::PathBuf>,
+    /// identical extra copies removed while organizing
+    pub dups_removed: u64,
 }

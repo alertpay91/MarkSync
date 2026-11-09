@@ -8,9 +8,21 @@ use std::path::Path;
 use std::sync::OnceLock;
 use std::time::SystemTime;
 
+/// Where the date came from — the last one is only a guess.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DateFrom {
+    #[default]
+    Unknown,
+    Exif,
+    Video,
+    Name,
+    FileTime,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Meta {
     pub date: Option<NaiveDateTime>,
+    pub date_from: DateFrom,
     pub gps: Option<(f64, f64)>,
     pub camera: Option<String>,
 }
@@ -34,24 +46,63 @@ pub fn read_meta(path: &Path, kind: Kind, mtime: SystemTime) -> Meta {
     let mut m = Meta::default();
     if kind == Kind::Image && has_exif(path) {
         read_exif(path, &mut m);
+        if m.date.is_some() {
+            m.date_from = DateFrom::Exif;
+        }
     }
     if m.date.is_none() && is_mp4_like(path) {
         m.date = mp4_creation(path);
+        if m.date.is_some() {
+            m.date_from = DateFrom::Video;
+        }
     }
     if m.date.is_none() {
         m.date = date_from_name(path.file_name().and_then(|n| n.to_str()).unwrap_or(""));
+        if m.date.is_some() {
+            m.date_from = DateFrom::Name;
+        }
     }
     if m.date.is_none() {
         let dt: DateTime<Local> = mtime.into();
         m.date = Some(dt.naive_local());
+        m.date_from = DateFrom::FileTime;
+    }
+    m
+}
+
+/// Metadata from the start of a file (phones: we don't read the whole file just for this).
+pub fn read_meta_bytes(name: &str, head: &[u8], kind: Kind, mtime: SystemTime) -> Meta {
+    let mut m = Meta::default();
+    if kind == Kind::Image && has_exif(Path::new(name)) {
+        if let Ok(ex) = exif::Reader::new().read_from_container(&mut std::io::Cursor::new(head)) {
+            exif_fields(&ex, &mut m);
+            if m.date.is_some() {
+                m.date_from = DateFrom::Exif;
+            }
+        }
+    }
+    if m.date.is_none() {
+        m.date = date_from_name(name);
+        if m.date.is_some() {
+            m.date_from = DateFrom::Name;
+        }
+    }
+    if m.date.is_none() && mtime > std::time::UNIX_EPOCH {
+        let dt: DateTime<Local> = mtime.into();
+        m.date = Some(dt.naive_local());
+        m.date_from = DateFrom::FileTime;
     }
     m
 }
 
 fn read_exif(path: &Path, m: &mut Meta) {
-    use exif::{In, Tag, Value};
     let Ok(f) = File::open(path) else { return };
     let Ok(ex) = exif::Reader::new().read_from_container(&mut BufReader::new(f)) else { return };
+    exif_fields(&ex, m);
+}
+
+fn exif_fields(ex: &exif::Exif, m: &mut Meta) {
+    use exif::{In, Tag, Value};
 
     for tag in [Tag::DateTimeOriginal, Tag::DateTimeDigitized, Tag::DateTime] {
         if let Some(field) = ex.get_field(tag, In::PRIMARY) {
@@ -200,6 +251,15 @@ fn mp4_creation(path: &Path) -> Option<NaiveDateTime> {
 
 /// Dates in names from phones and messengers: IMG_20240715_..., VID-20240715-WA0001, 2024-07-15 ...
 pub fn date_from_name(name: &str) -> Option<NaiveDateTime> {
+    let d = date_from_name_raw(name)?;
+    // Google Pixel names (PXL_20250905_094413504) are in UTC
+    if name.starts_with("PXL_") {
+        return Some(d.and_utc().with_timezone(&Local).naive_local());
+    }
+    Some(d)
+}
+
+fn date_from_name_raw(name: &str) -> Option<NaiveDateTime> {
     let b: Vec<char> = name.chars().collect();
     let num = |s: &[char]| -> Option<u32> {
         if s.iter().all(|c| c.is_ascii_digit()) {

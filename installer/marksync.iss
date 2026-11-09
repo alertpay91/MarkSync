@@ -4,6 +4,9 @@
 #ifndef AppVer
   #define AppVer "1.0.0"
 #endif
+#ifndef ExeDir
+  #define ExeDir "..\target\release"
+#endif
 
 [Setup]
 AppId={{8C5E2F7A-3B1D-4E9A-9F21-6D4C7B0A1E55}
@@ -40,7 +43,7 @@ Name: "ru"; MessagesFile: "compiler:Languages\Russian.isl"
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"
 
 [Files]
-Source: "..\target\release\marksync.exe"; DestDir: "{app}"; DestName: "MarkSync.exe"; Flags: ignoreversion
+Source: "{#ExeDir}\marksync.exe"; DestDir: "{app}"; DestName: "MarkSync.exe"; Flags: ignoreversion
 
 [Icons]
 Name: "{autoprograms}\{#AppName}"; Filename: "{app}\MarkSync.exe"

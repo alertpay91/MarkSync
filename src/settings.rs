@@ -42,6 +42,7 @@ pub struct Settings {
     pub theme: Theme,
     pub skip_hidden: bool,
     pub sources: Vec<SourceCfg>,
+    pub phone_sources: Vec<crate::phone::PhoneSource>,
     pub target: Option<PathBuf>,
     pub kinds: KindFilter,
     pub layout: LayoutChoice,
@@ -51,6 +52,9 @@ pub struct Settings {
     pub org_scheme: Scheme,
     pub org_mode: OrgMode,
     pub org_kinds: KindFilter,
+    pub org_keep_albums: bool,
+    pub org_flag_dates: bool,
+    pub org_remove_dups: bool,
     pub dup_roots: Vec<PathBuf>,
     pub dup_kinds: KindFilter,
     pub dup_action: DupAction,
@@ -65,6 +69,7 @@ impl Default for Settings {
             theme: Theme::Dark,
             skip_hidden: true,
             sources: Vec::new(),
+            phone_sources: Vec::new(),
             target: None,
             kinds: KindFilter::default(),
             layout: LayoutChoice::Keep,
@@ -74,6 +79,9 @@ impl Default for Settings {
             org_scheme: Scheme::YearMonth,
             org_mode: OrgMode::MoveInPlace,
             org_kinds: KindFilter::default(),
+            org_keep_albums: true,
+            org_flag_dates: true,
+            org_remove_dups: true,
             dup_roots: Vec::new(),
             dup_kinds: KindFilter::default(),
             dup_action: DupAction::RecycleBin,
@@ -94,6 +102,14 @@ fn file() -> PathBuf {
 }
 
 impl Settings {
+    pub fn org_options(&self) -> crate::organize::OrgOptions {
+        crate::organize::OrgOptions {
+            keep_albums: self.org_keep_albums,
+            flag_dates: self.org_flag_dates,
+            remove_dups: self.org_remove_dups,
+        }
+    }
+
     pub fn load() -> Self {
         let mut s: Settings = std::fs::read_to_string(file())
             .ok()

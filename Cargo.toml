@@ -1,6 +1,6 @@
 [package]
 name = "marksync"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 description = "MarkSync - poredi, kopira i sređuje slike, snimke i fajlove između računara i eksternog diska"
 
@@ -21,6 +21,7 @@ walkdir = "2.5.0"
 winreg = "0.56.0"
 egui_extras = { version = "0.29", default-features = false }
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_Debug"] }
+windows = { version = "0.58", features = ["Win32_Devices_PortableDevices", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_UI_Shell_PropertiesSystem", "Win32_Foundation", "Win32_System_Variant"] }
 
 [build-dependencies]
 winresource = "0.1"

@@ -7,6 +7,7 @@ mod i18n;
 mod job;
 mod meta;
 mod organize;
+mod phone;
 mod settings;
 mod sync;
 #[cfg(test)]
