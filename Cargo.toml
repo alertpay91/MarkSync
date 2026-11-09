@@ -1,0 +1,31 @@
+[package]
+name = "marksync"
+version = "1.0.0"
+edition = "2021"
+description = "MarkSync - poredi, kopira i sređuje slike, snimke i fajlove između računara i eksternog diska"
+
+[dependencies]
+eframe = "0.29"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp", "tiff"] }
+blake3 = "1.8.7"
+chrono = "0.4.45"
+filetime = "0.2.29"
+kamadak-exif = "0.6.2"
+rayon = "1.12.0"
+reverse_geocoder = "4.1.1"
+rfd = "0.18.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+trash = "5.3.0"
+walkdir = "2.5.0"
+winreg = "0.56.0"
+egui_extras = { version = "0.29", default-features = false }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_Debug"] }
+
+[build-dependencies]
+winresource = "0.1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
