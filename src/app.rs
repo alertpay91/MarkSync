@@ -1955,13 +1955,21 @@ impl MarkSync {
                     }
                 }
                 let bt = p.bytes_total.load(std::sync::atomic::Ordering::Relaxed);
+                let detail = p.detail.lock().unwrap().clone();
+                if !detail.is_empty() {
+                    ui.label(RichText::new(detail).size(14.0));
+                }
                 let mut info = if total > 0 {
-                    format!("{} / {}", fmt_num(done), fmt_num(total))
+                    tf("files_done", &[&fmt_num(done), &fmt_num(total)])
                 } else {
                     tf("found_n", &[&fmt_num(done)])
                 };
                 if bt > 0 {
-                    info.push_str(&format!("  ·  {} / {}", fmt_size(p.bytes.load(std::sync::atomic::Ordering::Relaxed)), fmt_size(bt)));
+                    info.push_str("  ·  ");
+                    info.push_str(&tf(
+                        "read_done",
+                        &[&fmt_size(p.bytes.load(std::sync::atomic::Ordering::Relaxed)), &fmt_size(bt)],
+                    ));
                 }
                 info.push_str(&format!("  ·  {}:{:02}", elapsed.as_secs() / 60, elapsed.as_secs() % 60));
                 ui.label(RichText::new(info).weak());

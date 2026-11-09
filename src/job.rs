@@ -8,6 +8,8 @@ pub struct Progress {
     /// i18n key of the current stage
     pub stage: Mutex<&'static str>,
     pub current: Mutex<String>,
+    /// one plain sentence explaining the current stage's numbers
+    pub detail: Mutex<String>,
     pub done: AtomicU64,
     pub total: AtomicU64,
     pub bytes: AtomicU64,
@@ -18,8 +20,12 @@ pub struct Progress {
 }
 
 impl Progress {
+    pub fn set_detail(&self, s: String) {
+        *self.detail.lock().unwrap() = s;
+    }
     pub fn stage(&self, key: &'static str, total: u64) {
         *self.stage.lock().unwrap() = key;
+        self.detail.lock().unwrap().clear();
         self.done.store(0, Ordering::Relaxed);
         self.total.store(total, Ordering::Relaxed);
     }

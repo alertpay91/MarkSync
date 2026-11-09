@@ -1,8 +1,8 @@
 [package]
 name = "marksync"
-version = "1.1.0"
+version = "1.1.1"
 edition = "2021"
-description = "MarkSync - poredi, kopira i sređuje slike, snimke i fajlove između računara i eksternog diska"
+description = "MarkSync - poredi, kopira i sre??uje slike, snimke i fajlove izme??u ra??unara i eksternog diska"
 
 [dependencies]
 eframe = "0.29"

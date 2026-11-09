@@ -432,6 +432,24 @@ pub fn compare(inp: &CompareInput, p: &Progress) -> Result<Vec<Item>, String> {
         .collect();
     let full_bytes: u64 = full_todo.iter().map(|&j| info(todo[j]).1).sum();
     p.stage("st_full_hash", full_todo.len() as u64);
+    {
+        // explain the numbers: both sides of every pair are read
+        let (mut ns, mut bs, mut nt, mut bt) = (0u64, 0u64, 0u64, 0u64);
+        for &j in &full_todo {
+            let size = info(todo[j]).1;
+            if todo[j].0 {
+                ns += 1;
+                bs += size;
+            } else {
+                nt += 1;
+                bt += size;
+            }
+        }
+        p.set_detail(tf(
+            "full_detail",
+            &[&crate::i18n::fmt_num(ns), &crate::i18n::fmt_size(bs), &crate::i18n::fmt_num(nt), &crate::i18n::fmt_size(bt)],
+        ));
+    }
     p.bytes.store(0, Ordering::Relaxed);
     p.bytes_total.store(full_bytes, Ordering::Relaxed);
     let full: Vec<(usize, Option<Hash>)> = full_todo
